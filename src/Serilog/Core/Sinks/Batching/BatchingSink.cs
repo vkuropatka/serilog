@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+using System.Diagnostics;
 using System.Threading.Channels;
 
 // ReSharper disable UnusedParameter.Global, ConvertIfStatementToConditionalTernaryExpression, MemberCanBePrivate.Global, UnusedMember.Global, VirtualMemberNeverOverridden.Global, ClassWithVirtualMembersNeverInherited.Global, SuspiciousTypeConversion.Global
@@ -46,6 +47,10 @@ sealed class BatchingSink : ILogEventSink, IDisposable, ISetLoggingFailureListen
     readonly FailureAwareBatchScheduler _batchScheduler;
     readonly Queue<LogEvent> _currentBatch = new();
     readonly Task _waitForShutdownSignal;
+    // Identifies the target sink among the measurements provided by batched sinks.
+    // It's necessary because a logging pipeline may include more than one batched sink
+    // so an aggregate across them won't really be useful.
+    readonly TagList _metricTags;
     Task<bool>? _cachedWaitToRead;
     ILoggingFailureListener _failureListener = SelfLog.FailureListener;
 
@@ -67,6 +72,7 @@ sealed class BatchingSink : ILogEventSink, IDisposable, ISetLoggingFailureListen
             throw new ArgumentOutOfRangeException(nameof(options), "The retry time limit must not be negative.");
 
         _targetSink = batchedSink ?? throw new ArgumentNullException(nameof(batchedSink));
+        _metricTags = new TagList { { SelfMetrics.TagNames.BatchedSinkType, _targetSink.GetType().FullName } };
         _batchSizeLimit = options.BatchSizeLimit;
         _queue = options.QueueLimit is { } limit
             ? Channel.CreateBounded<LogEvent>(new BoundedChannelOptions(limit) { SingleReader = true })
@@ -136,7 +142,7 @@ sealed class BatchingSink : ILogEventSink, IDisposable, ISetLoggingFailureListen
                 {
                     isEagerBatch = false;
 
-                    await _targetSink.EmitBatchAsync(_currentBatch).ConfigureAwait(false);
+                    await EmitCurrentBatchAsync().ConfigureAwait(false);
 
                     _currentBatch.Clear();
                     _batchScheduler.MarkSuccess();
@@ -187,7 +193,7 @@ sealed class BatchingSink : ILogEventSink, IDisposable, ISetLoggingFailureListen
 
                 if (_currentBatch.Count != 0)
                 {
-                    await _targetSink.EmitBatchAsync(_currentBatch).ConfigureAwait(false);
+                    await EmitCurrentBatchAsync().ConfigureAwait(false);
                     _currentBatch.Clear();
                 }
             }
@@ -197,6 +203,38 @@ sealed class BatchingSink : ILogEventSink, IDisposable, ISetLoggingFailureListen
             _failureListener.OnLoggingFailed(this, LoggingFailureKind.Permanent, "dropping the current batch", _currentBatch, ex);
             DrainOnFailure(LoggingFailureKind.Final, "failed emitting a batch during shutdown; dropping remaining queued events", ex, ignoreShutdownSignal: true);
         }
+    }
+
+    // Emits the current batch, timing the call so that the latency of the target (usually remote) sink can be
+    // observed. Failed batches are timed, too: a sink that has begun timing out is the case most worth measuring.
+    async Task EmitCurrentBatchAsync()
+    {
+        var startTimestamp = Stopwatch.GetTimestamp();
+
+        try
+        {
+            await _targetSink.EmitBatchAsync(_currentBatch).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            RecordEmitBatchDuration(startTimestamp, ex);
+            throw;
+        }
+
+        RecordEmitBatchDuration(startTimestamp, error: null);
+    }
+
+    void RecordEmitBatchDuration(long startTimestamp, Exception? error)
+    {
+        var tags = _metricTags;
+        if (error != null)
+        {
+            tags.Add(SelfMetrics.TagNames.ErrorType, error.GetType().FullName);
+        }
+
+        // Stopwatch.GetElapsedTime() is not available on all supported target frameworks.
+        var elapsedMilliseconds = (Stopwatch.GetTimestamp() - startTimestamp) * 1000.0 / Stopwatch.Frequency;
+        SelfMetrics.BatchingEmitBatchDuration.Record(elapsedMilliseconds, tags);
     }
 
     void DrainOnFailure(LoggingFailureKind kind, string message, Exception? exception, bool ignoreShutdownSignal = false)
