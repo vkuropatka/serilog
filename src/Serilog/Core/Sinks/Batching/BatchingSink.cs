@@ -47,10 +47,6 @@ sealed class BatchingSink : ILogEventSink, IDisposable, ISetLoggingFailureListen
     readonly FailureAwareBatchScheduler _batchScheduler;
     readonly Queue<LogEvent> _currentBatch = new();
     readonly Task _waitForShutdownSignal;
-    // Identifies the target sink among the measurements provided by batched sinks.
-    // It's necessary because a logging pipeline may include more than one batched sink
-    // so an aggregate across them won't really be useful.
-    readonly TagList _metricTags;
     Task<bool>? _cachedWaitToRead;
     ILoggingFailureListener _failureListener = SelfLog.FailureListener;
 
@@ -72,7 +68,6 @@ sealed class BatchingSink : ILogEventSink, IDisposable, ISetLoggingFailureListen
             throw new ArgumentOutOfRangeException(nameof(options), "The retry time limit must not be negative.");
 
         _targetSink = batchedSink ?? throw new ArgumentNullException(nameof(batchedSink));
-        _metricTags = new TagList { { SelfMetrics.TagNames.BatchedSinkType, _targetSink.GetType().FullName } };
         _batchSizeLimit = options.BatchSizeLimit;
         _queue = options.QueueLimit is { } limit
             ? Channel.CreateBounded<LogEvent>(new BoundedChannelOptions(limit) { SingleReader = true })
@@ -226,7 +221,7 @@ sealed class BatchingSink : ILogEventSink, IDisposable, ISetLoggingFailureListen
 
     void RecordEmitBatchDuration(long startTimestamp, Exception? error)
     {
-        var tags = _metricTags;
+        var tags = new TagList { { SelfMetrics.TagNames.BatchedSinkType, _targetSink.GetType().FullName } };
         if (error != null)
         {
             tags.Add(SelfMetrics.TagNames.ErrorType, error.GetType().FullName);
